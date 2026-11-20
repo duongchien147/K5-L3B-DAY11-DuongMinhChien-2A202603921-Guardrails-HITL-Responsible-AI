@@ -41,17 +41,67 @@ class MonitoringAlert:
     judge_checks: int = 0
     judge_fails: int = 0
 
+    def record(self, *, blocked: bool, rate_limited: bool = False,
+               judge_checked: bool = False, judge_failed: bool = False):
+        """Cập nhật bộ đếm sau mỗi request."""
+        self.total_requests += 1
+        if blocked:
+            self.blocked_requests += 1
+        if rate_limited:
+            self.rate_limit_hits += 1
+        if judge_checked:
+            self.judge_checks += 1
+            if judge_failed:
+                self.judge_fails += 1
+
     def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+        """Tính lại tỉ lệ và tạo Alert cho mỗi ngưỡng bị vượt.
+
+        Gọi nhiều lần không sinh alert trùng: mỗi metric chỉ giữ alert mới nhất.
+        """
+        snap = self.snapshot()
+        candidates = [
+            (
+                "block_rate",
+                snap["block_rate"],
+                self.block_rate_threshold,
+                snap["block_rate"] > self.block_rate_threshold,
+                "Block rate cao bất thường — có thể đang bị tấn công dồn dập "
+                "hoặc guardrail chặn nhầm.",
+            ),
+            (
+                "rate_limit_hits",
+                float(self.rate_limit_hits),
+                float(self.rate_limit_hit_threshold),
+                self.rate_limit_hits >= self.rate_limit_hit_threshold,
+                "Nhiều request bị rate limit — nghi spam / tấn công chi phí.",
+            ),
+            (
+                "judge_fail_rate",
+                snap["judge_fail_rate"],
+                self.judge_fail_rate_threshold,
+                self.judge_checks > 0
+                and snap["judge_fail_rate"] > self.judge_fail_rate_threshold,
+                "LLM judge đánh UNSAFE quá nhiều câu trả lời.",
+            ),
+        ]
+        fired = []
+        for metric, value, threshold, exceeded, message in candidates:
+            if exceeded:
+                fired.append(Alert(metric, round(value, 4), threshold, message))
+        fired_names = {a.metric for a in fired}
+        self.alerts = [a for a in self.alerts if a.metric not in fired_names] + fired
+        return fired
 
     def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
-        Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
-        create ``src/outputs/``.
-        """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+        """Ghi metrics + alerts ra ``<repo>/outputs/metrics.json`` (mặc định)."""
+        path = Path(filepath or default_metrics_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.check_metrics()
+        path.write_text(
+            json.dumps(self.snapshot(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (

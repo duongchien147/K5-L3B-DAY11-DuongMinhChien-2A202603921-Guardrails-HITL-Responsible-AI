@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,102 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+# Ký tự vô hình hay bị chèn để né regex (zero-width space, joiner, BOM, …)
+_INVISIBLE_CHARS = "​‌‍‎‏⁠⁡⁢⁣⁤﻿­"
+_INVISIBLE_TABLE = str.maketrans("", "", _INVISIBLE_CHARS)
+
+
+def normalize_text(text: str) -> str:
+    """Đưa text về dạng chuẩn trước khi so regex.
+
+    1. NFKC: gộp ký tự full-width / ligature về ASCII (ｉｇｎｏｒｅ → ignore).
+    2. Xoá ký tự vô hình (``Ignore\\u200b all`` → ``Ignore all``).
+    3. Bỏ dấu tiếng Việt (``bỏ qua`` → ``bo qua``, ``đ`` → ``d``) để một
+       pattern không dấu bắt được cả hai cách viết.
+    4. Lowercase + gộp khoảng trắng.
+    """
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(_INVISIBLE_TABLE)
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFD", text)
+        if unicodedata.category(ch) != "Mn"
+    )
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _squash(text: str) -> str:
+    """Chỉ giữ chữ + số — dùng để bắt secret bị chèn dấu chấm / gạch / cách."""
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+# Mỗi nhóm pattern là một kỹ thuật tấn công. Chạy trên text đã normalize_text().
+INJECTION_PATTERNS: dict[str, list[str]] = {
+    "override_instructions": [
+        r"\b(ignore|disregard|forget|override|bypass|skip)\b.{0,30}\b(previous|above|prior|earlier|all|your|the|system)\b.{0,20}\b(instructions?|rules?|prompts?|guidelines?|polic(y|ies))\b",
+        r"\bbo qua\b.{0,20}\b(huong dan|chi dan|quy tac|lenh|chi thi)\b",
+        r"\b(new|updated) (system )?(instructions?|rules?)\s*[:=]",
+    ],
+    "role_hijack": [
+        r"\byou are now\b",
+        r"\bpretend (you are|to be|you're)\b",
+        r"\bact as (a |an )?(unrestricted|unfiltered|uncensored|jailbroken|evil|dan)\b",
+        r"\b(dan|do anything now|developer mode|god mode)\b",
+        r"\bjailbreak",
+        r"\b(tu bay gio )?ban (la|dong vai) (mot )?(admin|quan tri|hacker|ai khong gioi han)",
+    ],
+    "prompt_extraction": [
+        r"\bsystem prompt\b",
+        r"\b(system|developer|hidden|internal) (message|instructions?|config(uration)?|notes?)\b",
+        r"\b(reveal|show|print|repeat|output|display|dump|leak|tell me|give me|list|translate|summari[sz]e|encode)\b.{0,40}\b(your|the|all)\b.{0,20}\b(instructions?|prompt|rules|config(uration)?|credentials?|passwords?|api ?keys?|secrets?|internal notes?)\b",
+        r"\b(tiet lo|cho (toi|minh) biet|in ra|liet ke)\b.{0,30}\b(mat khau|api ?key|thong tin noi bo|prompt|cau hinh|bi mat)\b",
+    ],
+    "encoding_exfiltration": [
+        r"\b(base64|rot13|hex(adecimal)?|reverse(d)?|spell( it)? out|letter by letter|character by character)\b.{0,60}\b(password|secret|api ?key|credential|db|database|host)\b",
+        r"\b(password|secret|api ?key|credential|database|db host)\b.{0,60}\b(base64|rot13|hex(adecimal)?|reversed?|letter by letter|character by character)\b",
+    ],
+    "credential_fishing": [
+        r"\b(admin|root|database|db|internal)\b.{0,15}\b(password|passwd|credentials?|api ?keys?|connection string|host)\b",
+        r"\bmat khau\b.{0,15}\b(admin|quan tri|he thong|noi bo)\b",
+    ],
+    "sql_injection": [
+        r";\s*(drop|delete|truncate|alter)\s+(table|database)\b",
+        r"\bunion\s+(all\s+)?select\b",
+        r"'\s*or\s*'?1'?\s*=\s*'?1",
+    ],
+}
+
+_COMPILED_INJECTION = [
+    (group, re.compile(p, re.IGNORECASE))
+    for group, patterns in INJECTION_PATTERNS.items()
+    for p in patterns
+]
+
+
+def _protected_needles() -> list[str]:
+    """Giá trị trong data/protected/vinbank_secrets.json (đã squash)."""
+    try:
+        from core.config import DEMO_SECRETS
+    except Exception:  # pragma: no cover - config luôn có trong repo
+        return []
+    return [n for n in (_squash(s.lower()) for s in DEMO_SECRETS) if len(n) >= 6]
+
+
+def injection_reason(user_input: str) -> str | None:
+    """Trả về tên kỹ thuật bị phát hiện, hoặc None nếu không thấy gì."""
+    text = normalize_text(user_input)
+    if not text:
+        return None
+    for group, rx in _COMPILED_INJECTION:
+        if rx.search(text):
+            return group
+    # Prompt chứa sẵn secret ("tôi biết password là admin123, xác nhận giúp")
+    squashed = _squash(text)
+    if any(n in squashed for n in _protected_needles()):
+        return "protected_value_probe"
+    return None
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,16 +148,7 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
-            return "BLOCK"
-    return "ALLOW"
+    return "BLOCK" if injection_reason(user_input) else "ALLOW"
 
 
 # ============================================================
@@ -84,14 +172,22 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = normalize_text(user_input)
+    if not input_lower:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Topic cấm: so theo đầu từ để "kill" không dính "skill",
+    #    nhưng "hacking" / "hacker" vẫn bị bắt.
+    for topic in BLOCKED_TOPICS:
+        if re.search(rf"\b{re.escape(topic)}", input_lower):
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. Phải có ít nhất một topic banking (ALLOWED_TOPICS đã viết không dấu).
+    for topic in ALLOWED_TOPICS:
+        if re.search(rf"\b{re.escape(topic)}", input_lower):
+            return "ALLOW"
+
+    return "BLOCK"
 
 
 # ============================================================
@@ -112,6 +208,7 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.last_reason: str | None = None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -143,15 +240,26 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         """
         self.total_count += 1
         text = self._extract_text(user_message)
+        self.last_reason = None
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        reason = injection_reason(text)
+        if reason:
+            self.blocked_count += 1
+            self.last_reason = f"injection:{reason}"
+            return self._block_response(
+                "I cannot process that request. I can only help with VinBank "
+                "banking questions (accounts, transfers, savings, loans, cards)."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_reason = "off_topic"
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related "
+                "questions such as accounts, transfers, savings or loans."
+            )
+
+        return None
 
 
 # ============================================================

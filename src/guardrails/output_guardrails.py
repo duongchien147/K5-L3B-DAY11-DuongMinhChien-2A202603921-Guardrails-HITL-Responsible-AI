@@ -37,29 +37,69 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    # 1. Giá trị secret thật trong data/protected/vinbank_secrets.json
+    #    (khớp nguyên văn, không phân biệt hoa thường).
+    for secret in _protected_values():
+        rx = re.compile(re.escape(secret), re.IGNORECASE)
+        if rx.search(redacted):
+            issues.append(f"protected_secret: '{secret[:3]}…' found")
+            redacted = rx.sub("[REDACTED]", redacted)
 
+    # 2. Pattern chung cho PII / secret. Thứ tự quan trọng: email trước phone
+    #    để chữ số trong email không bị cắt đôi.
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # 3. Secret bị chèn ký tự để né regex (a.d.m.i.n.1.2.3, s k - v i n …).
+    #    Không redact được từng ký tự an toàn → đánh dấu để plugin chặn cả câu.
+    squashed = re.sub(r"[^a-z0-9]", "", redacted.lower())
+    for secret in _protected_values():
+        needle = re.sub(r"[^a-z0-9]", "", secret.lower())
+        if len(needle) >= 6 and needle in squashed:
+            issues.append("obfuscated_secret: protected value split by separators")
+            break
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+PII_PATTERNS = {
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+    "api_key": r"\bsk-[a-zA-Z0-9_-]{6,}",
+    "password": r"\b(?:password|passwd|pwd|mat khau|mật khẩu)\b\s*(?:is|là|:|=)\s*\S+",
+    "internal_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d{2,5})?\b",
+    "vn_phone": r"(?<!\d)(?:\+84|84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+}
+
+# Câu chứa các loại này bị chặn hẳn, không chỉ redact.
+SECRET_ISSUE_TYPES = ("protected_secret", "api_key", "password", "internal_host", "obfuscated_secret")
+
+
+def _protected_values() -> list[str]:
+    try:
+        from core.config import DEMO_SECRETS, load_protected_payload
+
+        values = list(DEMO_SECRETS)
+        for v in (load_protected_payload().get("secrets") or {}).values():
+            if v and str(v) not in values:
+                values.append(str(v))
+    except Exception:
+        return []
+    # Dài trước để "db.vinbank.internal:5432" được thay trước "db.vinbank.internal"
+    return sorted({v for v in values if len(v) >= 4}, key=len, reverse=True)
+
+
+def has_secret_issue(issues: list[str]) -> bool:
+    return any(i.split(":", 1)[0] in SECRET_ISSUE_TYPES for i in issues)
 
 
 # ============================================================
@@ -149,6 +189,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_action: str | None = None
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +214,42 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_action = None
+        self.last_issues = []
 
-        return llm_response  # TODO: modify if needed
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.last_issues = result["issues"]
+            if has_secret_issue(result["issues"]):
+                # Lộ secret hệ thống → không trả bất kỳ phần nào của câu trả lời.
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = self._text_content(WITHHELD_MESSAGE)
+                return llm_response
+            # Chỉ có PII (SĐT, email, CCCD) → che rồi trả phần còn lại.
+            self.redacted_count += 1
+            self.last_action = "redacted"
+            llm_response.content = self._text_content(result["redacted"])
+            response_text = result["redacted"]
+
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "judge_blocked"
+                llm_response.content = self._text_content(WITHHELD_MESSAGE)
+
+        return llm_response
+
+    @staticmethod
+    def _text_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
+
+
+WITHHELD_MESSAGE = (
+    "I cannot share internal system details. I can help with VinBank banking "
+    "questions such as accounts, transfers, savings rates or loans."
+)
 
 
 # ============================================================

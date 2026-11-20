@@ -36,7 +36,8 @@ PROVIDER_OPENROUTER = "openrouter"
 
 # --- Blue Team (LOCKED) ---
 BLUE_PROVIDER = PROVIDER_OPENROUTER
-BLUE_MODEL = "liquid/lfm-3-1.7b:free"
+# Bản trả phí (bỏ hậu tố ":free" — free tier bị rate limit; lab coach cho phép)
+BLUE_MODEL = "liquid/lfm-3-1.7b"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = BLUE_MODEL  # alias
 
@@ -112,6 +113,13 @@ def get_openrouter_api_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
+def openrouter_base_url() -> str:
+    return (
+        os.environ.get("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL).strip()
+        or OPENROUTER_BASE_URL
+    )
+
+
 def blue_client_kwargs() -> dict:
     """OpenAI SDK kwargs pointing at OpenRouter (Blue Team only)."""
     return {
@@ -139,11 +147,24 @@ def get_red_provider() -> str:
     ).strip().lower()
     if raw in {"gemini", "google", "adk"}:
         return PROVIDER_GEMINI
+    if raw == PROVIDER_OPENROUTER:
+        return PROVIDER_OPENROUTER
     return PROVIDER_OPENAI
 
 
 def get_red_model() -> str:
-    """Model Red Team từ .env (cùng cho default + advance)."""
+    """Model Red Team từ .env (cùng cho default + advance).
+
+    ``RED_TEAM_PROVIDER=openrouter``: vẫn là Gemini (``GEMINI_MODEL``, mặc định
+    gemini-3.5-flash; model khó gemini-3.8-flash) nhưng gọi qua OpenRouter với
+    ID ``google/<model>``.
+    """
+    if get_red_provider() == PROVIDER_OPENROUTER:
+        name = (
+            os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
+            or DEFAULT_GEMINI_MODEL
+        )
+        return name if "/" in name else f"google/{name}"
     if get_red_provider() == PROVIDER_GEMINI:
         return (
             os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
@@ -170,6 +191,11 @@ def get_openai_api_key() -> str:
 
 
 def red_openai_client_kwargs() -> dict:
+    if get_red_provider() == PROVIDER_OPENROUTER:
+        return {
+            "api_key": get_openrouter_api_key() or None,
+            "base_url": openrouter_base_url(),
+        }
     return {"api_key": get_openai_api_key() or None}
 
 
@@ -180,7 +206,8 @@ def red_provider_label(tier: str = "advance") -> str:
 
 
 def red_uses_openai_sdk() -> bool:
-    return get_red_provider() == PROVIDER_OPENAI
+    # OpenRouter là endpoint OpenAI-compatible → đi cùng đường OpenAI SDK
+    return get_red_provider() in (PROVIDER_OPENAI, PROVIDER_OPENROUTER)
 
 
 def red_uses_gemini() -> bool:
@@ -216,7 +243,7 @@ def provider_label() -> str:
 
 def is_harder_model() -> bool:
     """True nếu .env đang trỏ model khó (luna / 3.8) — tuỳ chọn, không phải tên agent."""
-    m = get_red_model().lower()
+    m = get_red_model().lower().split("/")[-1]  # "google/gemini-3.8-flash" → "gemini-3.8-flash"
     if m in {DEFAULT_OPENAI_MODEL.lower(), DEFAULT_GEMINI_MODEL.lower()}:
         return False
     hard = {
@@ -244,7 +271,10 @@ def setup_api_key():
 
     red = get_red_provider()
     model = get_red_model()
-    if red == PROVIDER_GEMINI:
+    if red == PROVIDER_OPENROUTER:
+        # Cùng key OpenRouter với Blue (đã hỏi ở trên nếu thiếu)
+        print(f"Red / Red Advance  — openrouter:{model}")
+    elif red == PROVIDER_GEMINI:
         if not os.environ.get("GOOGLE_API_KEY", "").strip():
             os.environ["GOOGLE_API_KEY"] = input("Enter Google API Key (Red): ").strip()
         os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "0"

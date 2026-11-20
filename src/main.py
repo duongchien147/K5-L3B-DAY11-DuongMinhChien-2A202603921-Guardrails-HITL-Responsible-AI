@@ -24,6 +24,15 @@ _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+# Console Windows (cp1252) không in được tiếng Việt → UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except ValueError:
+            pass
+
 from core.config import setup_api_key
 
 
@@ -58,6 +67,7 @@ async def part3_assignment_suite():
     print("=" * 60)
 
     from assignment.pipeline import (
+        LLMAuthError,
         build_production_plugins,
         build_observability,
         run_assignment_suite,
@@ -79,6 +89,10 @@ async def part3_assignment_suite():
         )
         print(f"Detail: {e}")
         return None
+    except LLMAuthError as e:
+        print(f"\nDỪNG: {e}")
+        print("Không ghi outputs/results.json cho lần chạy này.")
+        return None
 
 
 async def part4_attacks():
@@ -92,7 +106,10 @@ async def part4_attacks():
     from attacks.attacks import run_attacks, save_attack_results
 
     red_default, red_default_runner = create_red_agent_default()
-    await test_agent(red_default, red_default_runner)
+    try:
+        await test_agent(red_default, red_default_runner)
+    except Exception as e:  # noqa: BLE001 — quick test chỉ để xem, không chặn CP4
+        print(f"(quick test lỗi, bỏ qua: {type(e).__name__}: {str(e)[:160]})")
 
     print("\n--- Attacks on Red ---")
     unsafe_results = await run_attacks(
